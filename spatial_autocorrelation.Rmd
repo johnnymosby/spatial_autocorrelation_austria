@@ -1,0 +1,180 @@
+---
+title: "spatial autocorrelation"
+author: "Ruslan Basyrov"
+date: "11/12/2023"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE)
+```
+
+```{r}
+library(sf)
+library(leaflet)
+library(tidyverse)
+library(tmap)
+library(spdep)
+library(data.table)
+library(RColorBrewer) 
+```
+
+Data references:
+- Eurostat. Database of demographic indicators. Link: https://ec.europa.eu/eurostat/web/population-demography/demography-population-stock-balance/database. Last accessed: 12.12.2023.
+- Eurostat. NUTS shapefiles. Link: https://ec.europa.eu/eurostat/web/gisco/geodata/reference-data/administrative-units-statistical-units/nuts. Last accessed: 12.12.2023
+
+```{r}
+country_of_choice = "AT"
+path = "/Users/johnnymosby/Dropbox/uni/Research Seminar/Poster/"
+country_codes = read.csv(paste0(path, "data/NUTS2021-NUTS2024.csv")) |> 
+    filter(Country.code == country_of_choice) |> 
+    select(-c(Country.code, Country.order, X.))
+```
+
+```{r echo=FALSE}
+shp_2021 = st_read(paste0(path, "/shapefiles/2021")) |> 
+    filter(NUTS_ID %in% country_codes$Code)
+
+sf::st_crs(shp_2021$geometry)
+```
+
+```{r}
+nuts2_borders = shp_2021 |>
+                  filter(NUTS_ID %in% country_codes[country_codes$NUTS.level == 2, "Code"])
+```
+
+### Calculating LE
+```{r}
+deaths = read.csv(paste0(path, "data/demo_r_magec3_linear.csv")) |> 
+    select(c(sex, age, geo, TIME_PERIOD, OBS_VALUE, OBS_FLAG)) |> 
+    filter(!(age %in% c("TOTAL", "UNK")),
+             geo %in% country_codes$Code)
+
+population = read.csv(paste0(path, "data/demo_r_pjangrp3_linear.csv")) |>
+    select(c(sex, age, geo, TIME_PERIOD, OBS_VALUE, OBS_FLAG)) |> 
+    filter(!(age %in% c("TOTAL", "UNK")),
+             geo %in% country_codes$Code)
+
+population = population |> 
+    group_by(geo, sex, age) |> 
+    mutate(midvalue = (OBS_VALUE + lag(OBS_VALUE)) / 2) |> 
+    na.omit()
+
+death_rates = population |> 
+    inner_join(deaths, by = c("sex", "age", "geo", "TIME_PERIOD")) |> 
+    mutate(nmx = OBS_VALUE.y / midvalue) |> 
+    select(TIME_PERIOD, geo, sex, age, nmx)
+
+death_rates$x = ifelse(death_rates$age == "Y_LT5", 0, str_extract(death_rates$age, "\\d+")) |> 
+    as.numeric()
+
+death_rates = death_rates |> 
+    arrange(TIME_PERIOD, geo, sex, x) |> 
+    select(TIME_PERIOD, geo, sex, age, x, nmx) |> 
+    mutate(nax = ifelse(x == 0, 0.14 + 4 * 0.5, ifelse(x == 90, 1 / nmx, 2.5)))
+```
+
+```{r}
+lifetable_function <- function(dataframe) {
+    result <- dataframe %>%
+        mutate(n = c(diff(x),0),
+               nqx = (n * nmx) / (1 + (n - nax) * nmx),
+               nqx = ifelse(x == max(x), 1, nqx),
+               npx = 1 - nqx,
+               lx = 100000 * cumprod(lag(npx, default  = 1)),
+               ndx = lx * nqx,
+               Lx = (lx - ndx) * n +  ndx * nax,
+               Tx = rev(cumsum(rev(Lx))),
+               ex = Tx / lx)
+    return(result)
+}
+```
+
+```{r}
+life_table = death_rates |> 
+    mutate(n = 0, nqx = 0, npx = 0, lx = 0, ndx = 0, Lx = 0, Tx = 0, ex = 0) |> as.data.table()
+
+len_unique = length(unique(life_table$x))
+n_groups = nrow(life_table) / len_unique
+
+for (i in 0:(n_groups - 1))
+{
+    life_table[(i * len_unique + 1):(i * len_unique + len_unique), ] = 
+        life_table[(i * len_unique + 1):(i * len_unique + len_unique), ] |> 
+        lifetable_function()
+}
+```
+
+```{r}
+life_table_nuts2 = life_table |> 
+    filter(geo %in% country_codes[country_codes$NUTS.level == 2, "Code"])
+
+shp_le_nuts2 = shp_2021 |>
+                  filter(NUTS_ID %in% country_codes[country_codes$NUTS.level == 2, "Code"]) |> 
+    left_join(life_table_nuts2,
+              by = join_by("NUTS_ID" == "geo")) |> 
+    filter(x == 0, TIME_PERIOD == 2021, sex == "T")
+```
+
+```{r}
+life_table_nuts3 = life_table |> 
+    filter(geo %in% country_codes[country_codes$NUTS.level == 3, "Code"])
+
+shp_le_nuts3 = shp_2021 |>
+                  filter(NUTS_ID %in% country_codes[country_codes$NUTS.level == 3, "Code"]) |> 
+    left_join(life_table_nuts3,
+              by = join_by("NUTS_ID" == "geo")) |> filter(x == 0, TIME_PERIOD == 2021, sex == "T")
+```
+
+### Global Moran's I
+```{r}
+neighbours_le_nuts2 <- poly2nb(shp_le_nuts2, queen=TRUE)
+list_weights_le_nuts_2 <- nb2listw(neighbours_le_nuts2, style="W", zero.policy=TRUE)
+
+moran.mc(shp_le_nuts2$ex, list_weights_le_nuts_2, nsim=999, alternative="greater")
+```
+
+```{r}
+neighbours_le_nuts3 <- poly2nb(shp_le_nuts3, queen=TRUE)
+list_weights_le_nuts_3 <- nb2listw(neighbours_le_nuts3, style="W", zero.policy=TRUE)
+
+moran.mc(shp_le_nuts3$ex, list_weights_le_nuts_3, nsim=999, alternative="greater")
+```
+
+### Maps of LE in Austria
+```{r}
+ggplot() +
+    geom_sf(shp_le_nuts2, mapping = aes(geometry = geometry,
+                                 fill = ex),
+            color = NA) +
+    theme(
+        panel.background = element_rect(fill = "#D9D9D9"),
+        panel.grid = element_line(color = "#D9D9D9")) +
+    geom_sf(nuts2_borders, mapping = aes(geometry = geometry), fill = NA, color = "white") +
+    scale_fill_distiller(palette = "Spectral",
+                         limits = c(79.75, 83),
+                         breaks = c(79.75, 81, 82, 83),
+                         direction = 1) +
+    labs(title = "LE in Austria by NUTS-2 in 2021, both sexes",
+         fill = "LE")
+```
+
+```{r}
+ggplot() +
+    geom_sf(shp_le_nuts3, mapping = aes(geometry = geometry,
+                                 fill = ex),
+            color = NA) +
+    theme(
+        panel.background = element_rect(fill = "#D9D9D9"),
+        panel.grid = element_line(color = "#D9D9D9")) +
+    geom_sf(nuts2_borders, mapping = aes(geometry = geometry), fill = NA, color = "white") +
+    scale_fill_distiller(palette = "Spectral",
+                         limits = c(79.75, 83),
+                         breaks = c(79.75, 81, 82, 83),
+                         direction = 1) +
+    labs(title = "LE in Austria by NUTS-2 in 2021, both sexes",
+         fill = "LE")
+```
+
